@@ -10,7 +10,7 @@ import (
 	"net/url"
 	"time"
 
-	tls "github.com/3andne/restls-client-go"
+	tls "github.com/metacubex/restls-client-go"
 	"golang.org/x/net/http2"
 )
 

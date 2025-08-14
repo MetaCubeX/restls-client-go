@@ -13,7 +13,7 @@ import (
 	"hash"
 	"log"
 
-	"github.com/3andne/restls-client-go/internal/helper"
+	"github.com/metacubex/restls-client-go/internal/helper"
 	"golang.org/x/crypto/cryptobyte"
 )
 

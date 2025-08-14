@@ -1,11 +1,6 @@
-module github.com/3andne/restls-client-go
+module github.com/metacubex/restls-client-go
 
 go 1.20
-
-retract (
-	v1.4.1 // #218
-	v1.4.0 // #218 panic on saveSessionTicket
-)
 
 require (
 	github.com/andybalholm/brotli v1.0.5

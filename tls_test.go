@@ -23,7 +23,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/3andne/restls-client-go/testenv"
+	"github.com/metacubex/restls-client-go/testenv"
 )
 
 var rsaCertPEM = `-----BEGIN CERTIFICATE-----

@@ -6,7 +6,7 @@ import (
 	"math"
 	"math/big"
 
-	"github.com/3andne/restls-client-go/quicvarint"
+	"github.com/metacubex/restls-client-go/quicvarint"
 )
 
 const (
