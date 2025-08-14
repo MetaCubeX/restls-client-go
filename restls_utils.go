@@ -9,7 +9,7 @@ import (
 	"strings"
 	"sync/atomic"
 
-	"lukechampine.com/blake3"
+	"github.com/metacubex/blake3"
 )
 
 type RestlsPlugin struct {

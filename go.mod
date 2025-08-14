@@ -6,14 +6,10 @@ require (
 	github.com/andybalholm/brotli v1.0.5
 	github.com/gaukas/godicttls v0.0.4
 	github.com/klauspost/compress v1.16.7
+	github.com/metacubex/blake3 v0.1.0
 	golang.org/x/crypto v0.12.0
 	golang.org/x/net v0.14.0
-	golang.org/x/sys v0.11.0
+	golang.org/x/sys v0.30.0
 )
 
-require (
-	github.com/klauspost/cpuid/v2 v2.0.9 // indirect
-	golang.org/x/text v0.12.0 // indirect
-)
-
-require lukechampine.com/blake3 v1.1.7
+require golang.org/x/text v0.12.0 // indirect
