@@ -453,6 +453,7 @@ func (c *UConn) clientHandshake(ctx context.Context) (err error) {
 		return err
 	}
 	if session != nil {
+		c.HandshakeState.Session = session // #Restls#
 		debugf(c.Conn, "session loaded\n")
 		defer func() {
 			// If we got a handshake failure when resuming a session, throw away
@@ -476,12 +477,20 @@ func (c *UConn) clientHandshake(ctx context.Context) (err error) {
 			return err
 		}
 	}
-	debugf(c.Conn, "%v, %v, %v\n", c.HandshakeState.Hello.SessionId, hello.sessionId, hello.raw[39:39+32])
-	copy(hello.raw[39:], hello.sessionId) // patch session id
+	if len(hello.sessionTicket) > 0 {
+		hello.raw = nil
+		if _, err := hello.marshal(); err != nil {
+			return err
+		}
+	} else {
+		debugf(c.Conn, "%v, %v, %v\n", c.HandshakeState.Hello.SessionId, hello.sessionId, hello.raw[39:39+32])
+		hello.raw = append([]byte(nil), hello.raw...)
+		copy(hello.raw[39:], hello.sessionId) // patch session id
+	}
 	// #Restls# End
 
 	cacheKey := c.clientSessionCacheKey()
-	if c.config.ClientSessionCache != nil {
+	if c.config.ClientSessionCache != nil && c.config.VersionHint == 0 {
 		cs, ok := c.config.ClientSessionCache.Get(cacheKey)
 		if !sessionIsAlreadySet && ok { // uTLS: do not overwrite already set session
 			err = c.SetSessionState(cs)
@@ -712,6 +721,39 @@ func (uconn *UConn) SetTLSVers(minTLSVers, maxTLSVers uint16, specExtensions []T
 	if maxTLSVers < VersionTLS10 || maxTLSVers > VersionTLS13 {
 		return fmt.Errorf("uTLS does not support 0x%X as max version", maxTLSVers)
 	}
+
+	// #Restls# Begin
+	if uconn.config.ForceTLS12 {
+		if maxTLSVers > VersionTLS12 {
+			maxTLSVers = VersionTLS12
+		}
+		if minTLSVers > maxTLSVers {
+			return fmt.Errorf("uTLS configured minimum version 0x%X is greater than maximum version 0x%X", minTLSVers, maxTLSVers)
+		}
+		for _, e := range specExtensions {
+			ext, ok := e.(*SupportedVersionsExtension)
+			if !ok {
+				continue
+			}
+			versions := ext.Versions[:0]
+			hasVersion := false
+			for _, vers := range ext.Versions {
+				if isGREASEUint16(vers) {
+					versions = append(versions, vers)
+					continue
+				}
+				if vers >= minTLSVers && vers <= maxTLSVers {
+					versions = append(versions, vers)
+					hasVersion = true
+				}
+			}
+			if !hasVersion {
+				versions = append(versions, makeSupportedVersions(minTLSVers, maxTLSVers)...)
+			}
+			ext.Versions = versions
+		}
+	}
+	// #Restls# End
 
 	uconn.HandshakeState.Hello.SupportedVersions = makeSupportedVersions(minTLSVers, maxTLSVers)
 	uconn.config.MinVersion = minTLSVers

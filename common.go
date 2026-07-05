@@ -815,6 +815,7 @@ type Config struct {
 	VersionHint  versionHint                    // #RESTLS#
 	RestlsScript []Line                         // #RESTLS#
 	ClientID     *atomic.Pointer[ClientHelloID] // #RESTLS#
+	ForceTLS12   bool                           // #RESTLS#
 }
 
 const (
@@ -900,6 +901,7 @@ func (c *Config) Clone() *Config {
 		RestlsSecret:                c.RestlsSecret, // #RESTLS#
 		RestlsScript:                c.RestlsScript, // #RESTLS#
 		ClientID:                    c.ClientID,     // #RESTLS#
+		ForceTLS12:                  c.ForceTLS12,   // #RESTLS#
 	}
 }
 

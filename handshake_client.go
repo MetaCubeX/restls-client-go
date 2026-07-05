@@ -847,6 +847,7 @@ func (hs *clientHandshakeState) serverResumedSession() bool {
 
 func (hs *clientHandshakeState) processServerHello() (bool, error) {
 	c := hs.c
+	c.serverRandom = hs.serverHello.random // #Restls#
 
 	if err := hs.pickCipherSuite(); err != nil {
 		return false, err

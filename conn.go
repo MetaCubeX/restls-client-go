@@ -638,6 +638,9 @@ func (c *Conn) extractRestlsAppData(record []byte) ([]byte, restlsCommand, error
 
 	header := record[:recordHeaderLen]
 	if c.restls12WithGCM && !c.restls12GCMServerDisableCtr {
+		if len(record) < recordHeaderLen+8+restlsAppDataAuthHeaderLength {
+			return nil, nil, alertBadRecordMAC
+		}
 		nonce := binary.BigEndian.Uint64(record[recordHeaderLen:])
 		if nonce != c.restlsToClientCounter+1 {
 			debugf(c, "nonce != c.restlsToClientCounter+1\n")
@@ -671,7 +674,10 @@ func (c *Conn) extractRestlsAppData(record []byte) ([]byte, restlsCommand, error
 	dataLen := int(binary.BigEndian.Uint16(record[restlsAppDataLenOffset:]))
 	command, err := parseCommand(record[restlsAppDataLenOffset+2:])
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, alertBadRecordMAC
+	}
+	if dataLen > len(record)-restlsAppDataOffset {
+		return nil, nil, alertBadRecordMAC
 	}
 	data := record[restlsAppDataOffset : restlsAppDataOffset+dataLen]
 	debugf(c, "extractRestlsAppData: lengthMask: %v, recordLen: %v, dataLen: %v, authMac: %v, to_server: %d, to_client: %d\n", mask, len(record), dataLen, authMac, c.restlsToServerCounter, c.restlsToClientCounter)
@@ -686,6 +692,9 @@ func (c *Conn) handleRestlsCommand(command restlsCommand, sent bool) {
 	switch command := command.(type) {
 	case ActResponse:
 		if sent {
+			if command == 0 {
+				return
+			}
 			command -= 1
 		}
 		for i := 0; i < int(command); i++ {
@@ -798,7 +807,7 @@ func (c *Conn) readRecordOrCCS(expectChangeCipherSpec bool) error {
 		hmac.Write(c.serverRandom)
 		serverRandomMac := hmac.Sum(nil)
 		recordCopy := append([]byte(nil), record...)
-		if c.restls12WithGCM && binary.BigEndian.Uint64(recordCopy[recordHeaderLen:recordHeaderLen+8]) == 0 {
+		if c.restls12WithGCM && len(recordCopy) >= recordHeaderLen+8 && binary.BigEndian.Uint64(recordCopy[recordHeaderLen:recordHeaderLen+8]) == 0 {
 			debugf(c, "restls12WithGCM record: %v\n", recordCopy)
 			xorWithMac(recordCopy[recordHeaderLen+8:], serverRandomMac[:restlsHandshakeMACLength])
 			debugf(c, "restls12WithGCM record (recovered)): %v\n", recordCopy)

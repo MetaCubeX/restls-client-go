@@ -104,7 +104,7 @@ type restlsCommand interface {
 	needInterrupt() bool
 }
 
-type ActResponse int8
+type ActResponse uint8
 
 func (a ActResponse) toBytes() [2]byte {
 	return [2]byte{0x01, byte(a)}
@@ -143,7 +143,7 @@ func (t TargetLength) Len() int {
 	return int(t[0])
 }
 
-func parseRecordScript(script string) []Line {
+func parseRecordScript(script string) ([]Line, error) {
 	script_split := strings.Split(strings.ReplaceAll(script, " ", ""), ",")
 	lines := []Line{}
 	for _, line_raw := range script_split {
@@ -151,18 +151,31 @@ func parseRecordScript(script string) []Line {
 			continue
 		}
 		line_bytes := []byte(line_raw)
-		targetLen := TargetLength{getInteger(&line_bytes)}
+		target, err := getInteger(&line_bytes)
+		if err != nil {
+			return nil, fmt.Errorf("invalid script %q: %w", line_raw, err)
+		}
+		if target > 32767 {
+			return nil, fmt.Errorf("invalid script %q: target len > 32767", line_raw)
+		}
+		targetLen := TargetLength{int16(target)}
 		if len(line_bytes) == 0 {
 			lines = append(lines, Line{targetLen, ActNoop{}})
 			continue
 		} else if line_bytes[0] == '~' || line_bytes[0] == '?' {
 			t := line_bytes[0]
 			line_bytes = line_bytes[1:]
-			randomRange := getInteger(&line_bytes)
-			if int(randomRange)+int(targetLen[0]) > 32768 {
-				panic("random target len > 32768")
+			randomRange, err := getInteger(&line_bytes)
+			if err != nil {
+				return nil, fmt.Errorf("invalid script %q: %w", line_raw, err)
 			}
-			targetLen[1] = randomRange
+			if randomRange > 32767 {
+				return nil, fmt.Errorf("invalid script %q: random target range > 32767", line_raw)
+			}
+			if randomRange+target > 32768 {
+				return nil, fmt.Errorf("invalid script %q: random target len > 32768", line_raw)
+			}
+			targetLen[1] = int16(randomRange)
 			if t == '?' {
 				targetLen[0] = int16(targetLen.Len())
 				targetLen[1] = 0
@@ -174,17 +187,26 @@ func parseRecordScript(script string) []Line {
 			continue
 		} else if line_bytes[0] == '<' {
 			line_bytes = line_bytes[1:]
-			numResponse := getInteger(&line_bytes)
+			numResponse, err := getInteger(&line_bytes)
+			if err != nil {
+				return nil, fmt.Errorf("invalid script %q: %w", line_raw, err)
+			}
+			if len(line_bytes) != 0 {
+				return nil, fmt.Errorf("invalid script %q: unexpected content %q", line_raw, string(line_bytes))
+			}
+			if numResponse >= 255 {
+				return nil, fmt.Errorf("invalid script %q: too many response in restls script, expect < 255, actual %d", line_raw, numResponse)
+			}
 			lines = append(lines, Line{targetLen, ActResponse(numResponse)})
 		} else {
-			panic(fmt.Sprintf("invalid script %s, %v", line_raw, line_bytes))
+			return nil, fmt.Errorf("invalid script %q: unexpected content %q", line_raw, string(line_bytes))
 		}
 	}
 	debugf(nil, "script: %v\n", lines)
-	return lines
+	return lines, nil
 }
 
-func getInteger(script *[]byte) int16 {
+func getInteger(script *[]byte) (int, error) {
 	res := 0
 	i := 0
 	for i = 0; i < len(*script); i++ {
@@ -195,11 +217,11 @@ func getInteger(script *[]byte) int16 {
 			break
 		}
 		if res > 32768 {
-			panic("target len > 32768")
+			return 0, fmt.Errorf("target len > 32768")
 		}
 	}
 	*script = (*script)[i:]
-	return int16(res)
+	return res, nil
 }
 
 var curveIDMap = map[CurveID]int{
@@ -258,7 +280,11 @@ func NewRestlsConfig(serverName string, password string, versionHintString strin
 	}
 	clientID := atomic.Pointer[ClientHelloID]{}
 	clientID.Store(clientIDPtr)
-	return &Config{RestlsSecret: key, VersionHint: versionHint, ServerName: serverName, RestlsScript: parseRecordScript(restlsScript), ClientSessionCache: NewLRUClientSessionCache(100), ClientID: &clientID, SessionTicketsDisabled: sessionTicketsDisabled}, nil
+	parsedScript, err := parseRecordScript(restlsScript)
+	if err != nil {
+		return nil, err
+	}
+	return &Config{RestlsSecret: key, VersionHint: versionHint, ServerName: serverName, RestlsScript: parsedScript, ClientSessionCache: NewLRUClientSessionCache(100), ClientID: &clientID, SessionTicketsDisabled: sessionTicketsDisabled}, nil
 }
 
 func AnyTrue[T any](vals []T, predicate func(T) bool) bool {

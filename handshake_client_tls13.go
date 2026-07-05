@@ -154,6 +154,7 @@ func (hs *clientHandshakeStateTLS13) handshake() error {
 // HelloRetryRequest messages. It sets hs.suite.
 func (hs *clientHandshakeStateTLS13) checkServerHelloOrHRR() error {
 	c := hs.c
+	c.serverRandom = hs.serverHello.random // #Restls#
 
 	if hs.serverHello.supportedVersion == 0 {
 		c.sendAlert(alertMissingExtension)
