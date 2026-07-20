@@ -41,6 +41,7 @@ type RestlsServerConfig struct {
 }
 
 var errInvalidTargetRecord = errors.New("restls: invalid target TLS record")
+var errInvalidTLSRecordHeader = errors.New("restls: invalid TLS record header")
 var errRawRelayClosed = errors.New("restls: raw relay closed without Restls connection")
 var restlsServerScriptCache sync.Map
 
@@ -92,11 +93,19 @@ func RestlsServer(ctx context.Context, inbound net.Conn, config *RestlsServerCon
 
 	firstClientRecord, err := readTLSRecord(inbound)
 	if err != nil {
+		if len(firstClientRecord) > 0 {
+			if _, writeErr := target.Write(firstClientRecord); writeErr != nil {
+				return nil, writeErr
+			}
+			return nil, relayRaw(inbound, target)
+		}
 		return nil, err
 	}
 	clientHello, err := parseClientHelloRecord(firstClientRecord)
 	if err != nil {
-		_, _ = target.Write(firstClientRecord)
+		if _, writeErr := target.Write(firstClientRecord); writeErr != nil {
+			return nil, writeErr
+		}
 		return nil, relayRaw(inbound, target)
 	}
 	state.clientHello = clientHello
@@ -106,15 +115,25 @@ func RestlsServer(ctx context.Context, inbound net.Conn, config *RestlsServerCon
 
 	firstServerRecord, err := readTLSRecord(target)
 	if err != nil {
+		if len(firstServerRecord) > 0 {
+			if _, writeErr := inbound.Write(firstServerRecord); writeErr != nil {
+				return nil, writeErr
+			}
+			return nil, relayRaw(inbound, target)
+		}
 		return nil, err
 	}
 	serverHello, err := parseServerHelloRecord(firstServerRecord)
 	if err != nil {
-		_, _ = inbound.Write(firstServerRecord)
+		if _, writeErr := inbound.Write(firstServerRecord); writeErr != nil {
+			return nil, writeErr
+		}
 		return nil, relayRaw(inbound, target)
 	}
 	if bytes.Equal(serverHello.random, helloRetryRequestRandom) {
-		_, _ = inbound.Write(firstServerRecord)
+		if _, writeErr := inbound.Write(firstServerRecord); writeErr != nil {
+			return nil, writeErr
+		}
 		return nil, relayRaw(inbound, target)
 	}
 	state.serverRandom = serverHello.random
@@ -133,7 +152,10 @@ func RestlsServer(ctx context.Context, inbound net.Conn, config *RestlsServerCon
 			return nil, err
 		}
 	} else {
-		if err := state.handshakeTLS12(inbound, target); err != nil {
+		if err := state.handshakeTLS12(inbound, target, firstServerRecord); err != nil {
+			if state.tls12Authenticated {
+				return nil, err
+			}
 			return nil, relayRaw(inbound, target)
 		}
 	}
@@ -166,6 +188,7 @@ type restlsServerState struct {
 
 	isTLS13             bool
 	isTLS12GCM          bool
+	tls12Authenticated  bool
 	tls13DidResume      bool
 	tls13TargetRawCount int
 	parrotGCM           bool
@@ -227,23 +250,35 @@ func cachedRestlsServerScript(script string) ([]Line, error) {
 
 func readTLSRecord(conn net.Conn) ([]byte, error) {
 	hdr := make([]byte, recordHeaderLen)
-	if _, err := io.ReadFull(conn, hdr); err != nil {
-		return nil, err
+	n, err := io.ReadFull(conn, hdr)
+	if err != nil {
+		return hdr[:n], err
 	}
-	n := int(hdr[3])<<8 | int(hdr[4])
-	record := make([]byte, recordHeaderLen+n)
+	payloadLen := int(hdr[3])<<8 | int(hdr[4])
+	version := uint16(hdr[1])<<8 | uint16(hdr[2])
+	if !isTLSRecordType(recordType(hdr[0])) || version < VersionSSL30 || version > VersionTLS13 || payloadLen > maxCiphertext {
+		return hdr, errInvalidTLSRecordHeader
+	}
+	record := make([]byte, recordHeaderLen+payloadLen)
 	copy(record, hdr)
-	_, err := io.ReadFull(conn, record[recordHeaderLen:])
-	return record, err
+	n, err = io.ReadFull(conn, record[recordHeaderLen:])
+	return record[:recordHeaderLen+n], err
+}
+
+func isTLSRecordType(typ recordType) bool {
+	switch typ {
+	case recordTypeChangeCipherSpec, recordTypeAlert, recordTypeHandshake, recordTypeApplicationData:
+		return true
+	default:
+		return false
+	}
 }
 
 func isValidTargetTLSRecord(record []byte) bool {
 	if len(record) < recordHeaderLen {
 		return false
 	}
-	switch recordType(record[0]) {
-	case recordTypeChangeCipherSpec, recordTypeAlert, recordTypeHandshake, recordTypeApplicationData:
-	default:
+	if !isTLSRecordType(recordType(record[0])) {
 		return false
 	}
 	vers := uint16(record[1])<<8 | uint16(record[2])
@@ -539,71 +574,125 @@ func (s *restlsServerState) isFirstRestlsClientRecord(record, clientFinished []b
 	return dataLen <= len(payload)-restlsAppDataOffset
 }
 
-func (s *restlsServerState) handshakeTLS12(inbound, target net.Conn) error {
+func (s *restlsServerState) handshakeTLS12(inbound, target net.Conn, firstServerRecord []byte) error {
 	var selectedCurve CurveID
+	serverHelloDone := false
+	var messages handshakeMessageReader
+	processHandshakeRecord := func(record []byte) error {
+		return messages.addRecord(record, func(msg []byte) bool {
+			if len(msg) >= 7 && msg[0] == typeServerKeyExchange && msg[4] == 3 {
+				selectedCurve = CurveID(msg[5])<<8 | CurveID(msg[6])
+			}
+			if len(msg) > 0 && msg[0] == typeServerHelloDone {
+				serverHelloDone = true
+				return false
+			}
+			return true
+		})
+	}
+	if err := processHandshakeRecord(firstServerRecord); err != nil {
+		return err
+	}
+	if serverHelloDone {
+		return s.finishTLS12FullHandshake(inbound, target, selectedCurve)
+	}
 	for {
 		record, err := readTLSRecord(target)
 		if err != nil {
+			if len(record) > 0 {
+				if _, writeErr := inbound.Write(record); writeErr != nil {
+					return writeErr
+				}
+			}
 			return err
 		}
 		switch recordType(record[0]) {
 		case recordTypeHandshake:
-			selectedCurve = curveFromServerHandshakeRecord(record, selectedCurve)
 			if _, err := inbound.Write(record); err != nil {
 				return err
 			}
-			if handshakeRecordContains(record, typeServerHelloDone) {
+			if err := processHandshakeRecord(record); err != nil {
+				return err
+			}
+			if serverHelloDone {
 				return s.finishTLS12FullHandshake(inbound, target, selectedCurve)
 			}
 		case recordTypeChangeCipherSpec:
-			if err := s.checkTLS12SessionTicket(); err != nil {
-				return err
-			}
 			if _, err := inbound.Write(record); err != nil {
 				return err
 			}
+			if err := s.checkTLS12SessionTicket(); err != nil {
+				return err
+			}
+			s.tls12Authenticated = true
 			return s.finishTLS12ResumedHandshake(inbound, target)
 		default:
+			if _, err := inbound.Write(record); err != nil {
+				return err
+			}
 			return fmt.Errorf("restls: unexpected TLS 1.2 server record type before client flight: %d", record[0])
 		}
 	}
 }
 
 func (s *restlsServerState) finishTLS12FullHandshake(inbound, target net.Conn, selectedCurve CurveID) error {
-	verifiedCKE := false
 	seenClientCCS := false
+	var messages handshakeMessageReader
 	for {
 		record, err := readTLSRecord(inbound)
 		if err != nil {
-			return err
-		}
-		if recordType(record[0]) == recordTypeHandshake {
-			if !verifiedCKE && selectedCurve != 0 {
-				if ckx, ok := clientKeyExchangeFromRecord(record); ok {
-					if err := s.checkTLS12ClientKeyExchange(ckx, selectedCurve); err != nil {
-						return err
-					}
-					verifiedCKE = true
+			if len(record) > 0 {
+				if _, writeErr := target.Write(record); writeErr != nil {
+					return writeErr
 				}
 			}
+			return err
 		}
+		var authenticationErr error
+		if recordType(record[0]) == recordTypeHandshake && !seenClientCCS && !s.tls12Authenticated && selectedCurve != 0 {
+			parseErr := messages.addRecord(record, func(msg []byte) bool {
+				if len(msg) == 0 || msg[0] != typeClientKeyExchange {
+					return true
+				}
+				ckx := new(clientKeyExchangeMsg)
+				if !ckx.unmarshal(msg) {
+					authenticationErr = errors.New("restls: malformed TLS 1.2 ClientKeyExchange")
+					return false
+				}
+				authenticationErr = s.checkTLS12ClientKeyExchange(ckx, selectedCurve)
+				if authenticationErr == nil {
+					s.tls12Authenticated = true
+				}
+				return false
+			})
+			if parseErr != nil {
+				authenticationErr = parseErr
+			}
+		}
+		var recordErr error
 		if recordType(record[0]) == recordTypeChangeCipherSpec {
 			if seenClientCCS {
-				return errors.New("restls: duplicate TLS 1.2 client CCS")
+				recordErr = errors.New("restls: duplicate TLS 1.2 client CCS")
+			} else if !isRestlsCCSRecord(record) {
+				recordErr = errors.New("restls: incorrect TLS 1.2 client CCS")
+			} else {
+				seenClientCCS = true
 			}
-			if !isRestlsCCSRecord(record) {
-				return errors.New("restls: incorrect TLS 1.2 client CCS")
-			}
-			seenClientCCS = true
 		}
 		if _, err := target.Write(record); err != nil {
 			return err
+		}
+		if authenticationErr != nil {
+			return authenticationErr
+		}
+		if recordErr != nil {
+			return recordErr
 		}
 		if seenClientCCS && recordType(record[0]) != recordTypeChangeCipherSpec {
 			break
 		}
 	}
-	if !verifiedCKE {
+	if !s.tls12Authenticated {
 		return errors.New("restls: TLS 1.2 ClientKeyExchange was not authenticated")
 	}
 
@@ -740,62 +829,37 @@ func (s *restlsServerState) maskServerAuth(record []byte) {
 	xorWithMac(record[offset:], mask)
 }
 
-func curveFromServerHandshakeRecord(record []byte, current CurveID) CurveID {
-	forEachHandshakeMessage(record, func(msg []byte) bool {
-		if len(msg) >= 7 && msg[0] == typeServerKeyExchange && msg[4] == 3 {
-			current = CurveID(msg[5])<<8 | CurveID(msg[6])
-		}
-		return true
-	})
-	return current
-}
-
-func handshakeRecordContains(record []byte, typ uint8) bool {
-	found := false
-	forEachHandshakeMessage(record, func(msg []byte) bool {
-		if len(msg) > 0 && msg[0] == typ {
-			found = true
-			return false
-		}
-		return true
-	})
-	return found
-}
-
 func isRestlsCCSRecord(record []byte) bool {
 	return bytes.Equal(record, []byte{byte(recordTypeChangeCipherSpec), 0x03, 0x03, 0x00, 0x01, 0x01})
 }
 
-func clientKeyExchangeFromRecord(record []byte) (*clientKeyExchangeMsg, bool) {
-	var ret *clientKeyExchangeMsg
-	forEachHandshakeMessage(record, func(msg []byte) bool {
-		if len(msg) > 0 && msg[0] == typeClientKeyExchange {
-			ckx := new(clientKeyExchangeMsg)
-			if ckx.unmarshal(msg) {
-				ret = ckx
-			}
-			return false
-		}
-		return true
-	})
-	return ret, ret != nil
+type handshakeMessageReader struct {
+	pending []byte
 }
 
-func forEachHandshakeMessage(record []byte, fn func([]byte) bool) {
-	if len(record) <= recordHeaderLen || recordType(record[0]) != recordTypeHandshake {
-		return
+func (r *handshakeMessageReader) addRecord(record []byte, fn func([]byte) bool) error {
+	if len(record) < recordHeaderLen || recordType(record[0]) != recordTypeHandshake {
+		return errors.New("restls: expected TLS handshake record")
 	}
-	payload := record[recordHeaderLen:]
-	for len(payload) >= 4 {
-		n := int(payload[1])<<16 | int(payload[2])<<8 | int(payload[3])
-		if len(payload) < 4+n {
-			return
+	r.pending = append(r.pending, record[recordHeaderLen:]...)
+	for len(r.pending) >= 4 {
+		n := int(r.pending[1])<<16 | int(r.pending[2])<<8 | int(r.pending[3])
+		if n > maxHandshake {
+			return fmt.Errorf("restls: TLS handshake message length %d exceeds maximum %d", n, maxHandshake)
 		}
-		if !fn(payload[:4+n]) {
-			return
+		if len(r.pending) < 4+n {
+			return nil
 		}
-		payload = payload[4+n:]
+		msg := r.pending[:4+n]
+		r.pending = r.pending[4+n:]
+		if !fn(msg) {
+			return nil
+		}
 	}
+	if len(r.pending) == 0 {
+		r.pending = nil
+	}
+	return nil
 }
 
 func relayRaw(a, b net.Conn) error {
