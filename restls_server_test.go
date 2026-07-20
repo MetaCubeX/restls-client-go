@@ -587,6 +587,46 @@ func TestRestlsServerCloseNotify(t *testing.T) {
 	}
 }
 
+func TestNewRateLimitedConnDisabled(t *testing.T) {
+	conn, peer := net.Pipe()
+	defer conn.Close()
+	defer peer.Close()
+	if limited := newRateLimitedConn(conn, 0); limited != conn {
+		t.Fatal("zero rate limit wrapped connection")
+	}
+}
+
+func TestRateLimitedConnBurst(t *testing.T) {
+	conn, peer := net.Pipe()
+	defer peer.Close()
+	limited := newRateLimitedConn(conn, 800).(*rateLimitedConn)
+	defer limited.Close()
+	if limited.burst != 1 {
+		t.Fatalf("burst = %d, want 1", limited.burst)
+	}
+}
+
+func TestBitRateLimiterReservations(t *testing.T) {
+	limiter := &bitRateLimiter{rateBps: 800}
+	now := time.Unix(0, 0)
+	if delay := limiter.reserveN(now, 1); delay != 0 {
+		t.Fatalf("initial reservation delay = %s, want 0", delay)
+	}
+	if delay := limiter.reserveN(now, 1); delay != 10*time.Millisecond {
+		t.Fatalf("second reservation delay = %s, want 10ms", delay)
+	}
+}
+
+func TestBitRateLimiterCancellation(t *testing.T) {
+	limiter := &bitRateLimiter{rateBps: 8}
+	limiter.reserveN(time.Now(), 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := limiter.WaitN(ctx, 1); !errors.Is(err, context.Canceled) {
+		t.Fatalf("WaitN error = %v, want context.Canceled", err)
+	}
+}
+
 func testRestlsServerRoundTripForClientIDMap(t *testing.T, version uint16, versionHint string) {
 	t.Helper()
 

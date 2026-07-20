@@ -35,6 +35,10 @@ type RestlsServerConfig struct {
 	// used after the script is exhausted. If zero, RestlsServer uses 15.
 	MinRecordLen int
 
+	// RateLimit limits fallback relay traffic in bits per second in each
+	// direction. If zero, fallback traffic is not rate limited.
+	RateLimit uint64
+
 	// DialContext opens the outbound connection to ServerHostname. If nil,
 	// RestlsServer uses a zero-value net.Dialer.
 	DialContext func(ctx context.Context, network, address string) (net.Conn, error)
@@ -45,7 +49,12 @@ var errInvalidTLSRecordHeader = errors.New("restls: invalid TLS record header")
 var errRawRelayClosed = errors.New("restls: raw relay closed without Restls connection")
 var restlsServerScriptCache sync.Map
 
-const restlsServerCloseDrainTimeout = time.Second
+const (
+	restlsServerCloseDrainTimeout = time.Second
+	bitsPerByte                   = 8
+	rateLimitCycle                = 10 * time.Millisecond
+	maxRateLimitBurstBytes        = 64 * 1024
+)
 
 // RestlsServer completes the Restls handshake and returns the authenticated
 // plaintext connection.
@@ -97,7 +106,7 @@ func RestlsServer(ctx context.Context, inbound net.Conn, config *RestlsServerCon
 			if _, writeErr := target.Write(firstClientRecord); writeErr != nil {
 				return nil, writeErr
 			}
-			return nil, relayRaw(inbound, target)
+			return nil, relayRaw(inbound, target, config.RateLimit)
 		}
 		return nil, err
 	}
@@ -106,7 +115,7 @@ func RestlsServer(ctx context.Context, inbound net.Conn, config *RestlsServerCon
 		if _, writeErr := target.Write(firstClientRecord); writeErr != nil {
 			return nil, writeErr
 		}
-		return nil, relayRaw(inbound, target)
+		return nil, relayRaw(inbound, target, config.RateLimit)
 	}
 	state.clientHello = clientHello
 	if _, err := target.Write(firstClientRecord); err != nil {
@@ -119,7 +128,7 @@ func RestlsServer(ctx context.Context, inbound net.Conn, config *RestlsServerCon
 			if _, writeErr := inbound.Write(firstServerRecord); writeErr != nil {
 				return nil, writeErr
 			}
-			return nil, relayRaw(inbound, target)
+			return nil, relayRaw(inbound, target, config.RateLimit)
 		}
 		return nil, err
 	}
@@ -128,13 +137,13 @@ func RestlsServer(ctx context.Context, inbound net.Conn, config *RestlsServerCon
 		if _, writeErr := inbound.Write(firstServerRecord); writeErr != nil {
 			return nil, writeErr
 		}
-		return nil, relayRaw(inbound, target)
+		return nil, relayRaw(inbound, target, config.RateLimit)
 	}
 	if bytes.Equal(serverHello.random, helloRetryRequestRandom) {
 		if _, writeErr := inbound.Write(firstServerRecord); writeErr != nil {
 			return nil, writeErr
 		}
-		return nil, relayRaw(inbound, target)
+		return nil, relayRaw(inbound, target, config.RateLimit)
 	}
 	state.serverRandom = serverHello.random
 	state.isTLS13 = serverHello.supportedVersion == VersionTLS13
@@ -146,7 +155,7 @@ func RestlsServer(ctx context.Context, inbound net.Conn, config *RestlsServerCon
 
 	if state.isTLS13 {
 		if err := state.checkTLS13ClientAuth(); err != nil {
-			return nil, relayRaw(inbound, target)
+			return nil, relayRaw(inbound, target, config.RateLimit)
 		}
 		if err := state.handshakeTLS13(inbound, target); err != nil {
 			return nil, err
@@ -156,7 +165,7 @@ func RestlsServer(ctx context.Context, inbound net.Conn, config *RestlsServerCon
 			if state.tls12Authenticated {
 				return nil, err
 			}
-			return nil, relayRaw(inbound, target)
+			return nil, relayRaw(inbound, target, config.RateLimit)
 		}
 	}
 
@@ -862,7 +871,8 @@ func (r *handshakeMessageReader) addRecord(record []byte, fn func([]byte) bool) 
 	return nil
 }
 
-func relayRaw(a, b net.Conn) error {
+func relayRaw(a, b net.Conn, rateLimit uint64) error {
+	b = newRateLimitedConn(b, rateLimit)
 	errc := make(chan error, 2)
 	go func() {
 		_, err := io.Copy(a, b)
@@ -879,6 +889,118 @@ func relayRaw(a, b net.Conn) error {
 		return err
 	}
 	return errRawRelayClosed
+}
+
+type rateLimitedConn struct {
+	net.Conn
+	ctx          context.Context
+	cancel       context.CancelFunc
+	readLimiter  *bitRateLimiter
+	writeLimiter *bitRateLimiter
+	burst        int
+}
+
+func newRateLimitedConn(conn net.Conn, rateBps uint64) net.Conn {
+	if rateBps == 0 {
+		return conn
+	}
+	burst := rateBps / bitsPerByte / uint64(time.Second/rateLimitCycle)
+	if burst == 0 {
+		burst = 1
+	} else if burst > maxRateLimitBurstBytes {
+		burst = maxRateLimitBurstBytes
+	}
+	limitCtx, cancel := context.WithCancel(context.Background())
+	return &rateLimitedConn{
+		Conn:         conn,
+		ctx:          limitCtx,
+		cancel:       cancel,
+		readLimiter:  &bitRateLimiter{rateBps: rateBps},
+		writeLimiter: &bitRateLimiter{rateBps: rateBps},
+		burst:        int(burst),
+	}
+}
+
+func (c *rateLimitedConn) Read(p []byte) (n int, err error) {
+	if len(p) > c.burst {
+		p = p[:c.burst]
+	}
+	n, err = c.Conn.Read(p)
+	if n > 0 {
+		if limitErr := c.readLimiter.WaitN(c.ctx, n); err == nil {
+			err = limitErr
+		}
+	}
+	return
+}
+
+func (c *rateLimitedConn) Write(p []byte) (n int, err error) {
+	for len(p) > 0 {
+		chunkSize := len(p)
+		if chunkSize > c.burst {
+			chunkSize = c.burst
+		}
+		if err = c.writeLimiter.WaitN(c.ctx, chunkSize); err != nil {
+			return n, err
+		}
+		var written int
+		written, err = c.Conn.Write(p[:chunkSize])
+		n += written
+		p = p[written:]
+		if err != nil {
+			return n, err
+		}
+		if written != chunkSize {
+			return n, io.ErrShortWrite
+		}
+	}
+	return n, nil
+}
+
+func (c *rateLimitedConn) Close() error {
+	c.cancel()
+	return c.Conn.Close()
+}
+
+func (c *rateLimitedConn) CloseWrite() error {
+	if conn, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return conn.CloseWrite()
+	}
+	return c.Close()
+}
+
+type bitRateLimiter struct {
+	mu      sync.Mutex
+	rateBps uint64
+	next    time.Time
+}
+
+func (l *bitRateLimiter) WaitN(ctx context.Context, n int) error {
+	delay := l.reserveN(time.Now(), n)
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (l *bitRateLimiter) reserveN(now time.Time, n int) time.Duration {
+	interval := time.Duration(uint64(n) * bitsPerByte * uint64(time.Second) / l.rateBps)
+
+	l.mu.Lock()
+	ready := l.next
+	if ready.Before(now) {
+		ready = now
+	}
+	l.next = ready.Add(interval)
+	l.mu.Unlock()
+	return ready.Sub(now)
 }
 
 type restlsServerConn struct {

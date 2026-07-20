@@ -7,5 +7,13 @@ It is able to parrot four types of TLS clients:
 * `safari`
 * `firefox`
 
+## Server
+
+`RestlsServer` accepts authenticated Restls connections and transparently
+relays unauthenticated or ordinary TLS connections to `ServerHostname`.
+`RestlsServerConfig.RateLimit` can limit fallback traffic in both directions in
+bits per second. A value of `0` disables the limit. Authenticated Restls traffic
+is not rate limited.
+
 ## Credits
 `restls-client-go` is developed based on [refraction-networking/utls](https://github.com/refraction-networking/utls).
